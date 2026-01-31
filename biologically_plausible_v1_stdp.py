@@ -117,7 +117,7 @@ class Params:
     # LGN->V1 weights & delays
     delay_max: int = 12
     w_init_mean: float = 0.25  # Scaled for Izhikevich (total input ~15-30 pA)
-    w_init_std: float = 0.08
+    w_init_std: float = 0.12  # Increased variance for diverse starting conditions
     w_max: float = 1.0
 
     # Homeostatic synaptic scaling (replaces global normalization)
@@ -151,7 +151,7 @@ class Params:
     # E->SOM (lateral inhibition drive from this ensemble)
     w_e_som: float = 6.0
     # SOM->E (lateral inhibition with Mexican-hat profile)
-    w_som_e: float = 4.0  # Peak inhibition strength
+    w_som_e: float = 2.5  # Peak inhibition strength (reduced to allow more neurons to learn)
     som_inhibit_peak: float = 2.0  # Distance (in ensemble units) at which inhibition peaks
     som_inhibit_sigma: float = 1.5  # Width of the ring of inhibition
 
