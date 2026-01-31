@@ -1,0 +1,10 @@
+# Core dependencies
+numpy>=1.20.0
+matplotlib>=3.4.0
+
+# Optional GPU acceleration (highly recommended)
+# Install with: pip install cupy-cuda11x  (or cupy-cuda12x depending on your CUDA version)
+# cupy>=10.0.0
+
+# For development
+scipy>=1.7.0
