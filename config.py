@@ -18,7 +18,7 @@ SIM_DURATION_TEST = 1000  # Test duration per orientation in ms
 # NETWORK DIMENSIONS
 # =============================================================================
 # Retinal/LGN dimensions (visual field representation)
-RETINA_SIZE = 32  # 32x32 grid for RGC/LGN (smaller for faster simulation)
+RETINA_SIZE = 16  # 16x16 grid for RGC/LGN (very small for fast testing)
 
 # LGN patch size that projects to one hypercolumn
 LGN_PATCH_SIZE = 8  # 8x8 patch
@@ -105,27 +105,27 @@ E_GABA = -75.0
 # =============================================================================
 
 # RGC -> LGN (one-to-one, strong)
-W_RGC_LGN = 3.0  # Relay connection
+W_RGC_LGN = 8.0  # Relay connection
 
-# LGN -> V1 (plastic, initially very weak)
-W_LGN_V1_INIT_MEAN = 0.005  # Very weak initial (need many spikes to drive V1)
-W_LGN_V1_INIT_STD = 0.002   # Initial weight std
-W_LGN_V1_MIN = 0.0          # Minimum weight (for STDP bounds)
-W_LGN_V1_MAX = 0.15         # Maximum weight (for STDP bounds)
+# LGN -> V1 (plastic, with HIGH VARIANCE for diversity)
+W_LGN_V1_INIT_MEAN = 0.05  # Low mean weight (reduced for lower firing rates)
+W_LGN_V1_INIT_STD = 0.05   # High std = 100% of mean (creates big differences between ensembles)
+W_LGN_V1_MIN = 0.0         # Minimum weight
+W_LGN_V1_MAX = 0.5         # Maximum weight for STDP (lower cap)
 
 # Conduction delays (ms)
 DELAY_RGC_LGN = 2.0       # Fast relay
 DELAY_LGN_V1_MIN = 1.0    # Minimum thalamocortical delay
-DELAY_LGN_V1_MAX = 8.0    # Maximum thalamocortical delay (varied per projection)
+DELAY_LGN_V1_MAX = 5.0    # Maximum thalamocortical delay
 
 # V1 Lateral connections
-W_V1_EXC_LOCAL = 0.05     # Excitatory weight (for E->I)
-W_V1_INH = 0.8            # Strong inhibitory strength for winner-take-all
+W_V1_EXC_LOCAL = 0.1      # E->I weight (reduced to prevent I saturation)
+W_V1_INH = 0.3            # Inhibitory strength (moderate for competition)
 
 # Connection probabilities
-P_LGN_V1 = 0.2            # Probability of LGN->V1 connection (sparse for diversity)
+P_LGN_V1 = 0.3            # Moderate sparsity
 P_V1_LATERAL_EXC = 0.1    # Probability of lateral excitatory connection
-P_V1_LATERAL_INH = 0.5    # Higher probability for inhibition
+P_V1_LATERAL_INH = 0.3    # Sparser inhibition
 
 # =============================================================================
 # STDP PARAMETERS
@@ -133,9 +133,9 @@ P_V1_LATERAL_INH = 0.5    # Higher probability for inhibition
 # =============================================================================
 
 STDP_TAU_PLUS = 20.0   # Time constant for potentiation (ms)
-STDP_TAU_MINUS = 20.0  # Time constant for depression (ms)
-STDP_A_PLUS = 0.003    # Maximum potentiation (small for stable learning)
-STDP_A_MINUS = 0.0035  # Maximum depression (slightly larger for stability)
+STDP_TAU_MINUS = 25.0  # Time constant for depression (longer = more depression)
+STDP_A_PLUS = 0.008    # Maximum potentiation
+STDP_A_MINUS = 0.012   # Maximum depression (50% stronger than potentiation)
 STDP_W_MAX = W_LGN_V1_MAX  # Maximum weight
 
 # =============================================================================
@@ -143,8 +143,11 @@ STDP_W_MAX = W_LGN_V1_MAX  # Maximum weight
 # =============================================================================
 
 # Drifting grating parameters
-GRATING_SPATIAL_FREQ = 0.15  # Cycles per pixel
-GRATING_TEMPORAL_FREQ = 2.0  # Hz (drift speed)
+# For delay-based selectivity: wave speed should match delay differences
+# Delay range is 1-5ms (4ms), patch is 8 pixels -> need 2 pixels/ms = 2000 pixels/sec
+# With spatial_freq = 0.25 cycles/pixel, temporal_freq = 500 Hz -> speed = 2000 px/s
+GRATING_SPATIAL_FREQ = 0.25  # Cycles per pixel
+GRATING_TEMPORAL_FREQ = 500.0 # Hz (very fast to match STDP timescale)
 GRATING_CONTRAST = 1.0       # Full contrast
 GRATING_ORIENTATIONS = np.linspace(0, 180, N_ORIENTATIONS, endpoint=False)  # Degrees
 

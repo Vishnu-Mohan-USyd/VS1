@@ -238,61 +238,86 @@ class VisualCortexNetwork:
         # Convert delays to GPU
         self.lgn_v1_delays = to_gpu(self.lgn_v1_delays)
 
-        # Pre-compute average delays per LGN neuron for efficiency
-        # Use a single average delay for all LGN neurons
-        delay_mask = weights > 0
-        if np.sum(delay_mask) > 0:
-            avg_delay = np.mean(self.lgn_v1_delays[delay_mask].get() if GPU_AVAILABLE else self.lgn_v1_delays[delay_mask])
-        else:
-            avg_delay = DELAY_LGN_V1_MIN
+        # Compute per-V1-ensemble average delays for temporal diversity
+        # Each ensemble gets a different effective delay based on its input connections
+        delays_np = self.lgn_v1_delays.get() if GPU_AVAILABLE else self.lgn_v1_delays
+
+        # Compute average delay per V1 NEURON (not per LGN neuron)
+        # This creates temporal diversity between ensembles
+        self.v1_input_delays = np.zeros(n_v1_exc, dtype=np.float32)
+        for v1_idx in range(n_v1_exc):
+            connected = weights[:, v1_idx] > 0
+            if np.sum(connected) > 0:
+                self.v1_input_delays[v1_idx] = np.mean(delays_np[:, v1_idx][connected])
+            else:
+                self.v1_input_delays[v1_idx] = (DELAY_LGN_V1_MIN + DELAY_LGN_V1_MAX) / 2
+
+        # Assign each ensemble a characteristic delay (random within range)
+        # This creates diversity BETWEEN ensembles, not just between neurons
+        for hc_idx in range(self.n_hypercolumns):
+            for ori_idx in range(self.n_orientations):
+                v1_indices = self.exc_idx[hc_idx, ori_idx, :].flatten()
+                # Random delay offset for this ensemble (breaks symmetry)
+                ensemble_delay = DELAY_LGN_V1_MIN + np.random.random() * (DELAY_LGN_V1_MAX - DELAY_LGN_V1_MIN)
+                self.v1_input_delays[v1_indices] = ensemble_delay
+
+        # For the LGN delay buffer, we still use per-LGN-neuron delays
+        # But now different V1 neurons will receive spikes at different times
+        # based on their ensemble's characteristic delay
+        avg_delay = np.mean(self.v1_input_delays)
         self.avg_lgn_v1_delays = to_gpu(np.full(n_lgn, avg_delay, dtype=np.float32))
-        print(f"Average LGN-V1 delay: {avg_delay:.2f} ms")
+        print(f"V1 input delays: min={np.min(self.v1_input_delays):.2f}, max={np.max(self.v1_input_delays):.2f}, mean={avg_delay:.2f} ms")
 
     def _init_v1_lateral_connections(self):
         """
-        Initialize lateral connections within V1.
+        Initialize lateral connections within V1 for winner-take-all competition.
 
-        - Excitatory connections: Between neurons with similar orientation preference
-        - Inhibitory connections: Between neurons with different orientation preferences
-          (especially orthogonal) to create competition
+        Implements cross-inhibition: each inhibitory neuron is associated with
+        one ensemble, receives input from that ensemble, and suppresses OTHER
+        ensembles. This creates competition without hardcoding orientation.
         """
         print("Initializing V1 lateral connections...")
 
-        # Excitatory lateral connections (E -> E, E -> I)
-        # Within hypercolumn, similar orientations excite each other
-
-        # E -> E weights
+        # E -> E weights (no lateral excitation for cleaner competition)
         self.w_exc_exc = np.zeros((self.n_v1_exc, self.n_v1_exc), dtype=np.float32)
 
-        # E -> I weights (excitatory neurons drive inhibitory)
+        # E -> I weights (excitatory neurons drive their associated inhibitory neurons)
         self.w_exc_inh = np.zeros((self.n_v1_exc, self.n_v1_inh), dtype=np.float32)
 
-        # I -> E weights (inhibitory neurons suppress excitatory)
+        # I -> E weights (inhibitory neurons suppress OTHER ensembles)
         self.w_inh_exc = np.zeros((self.n_v1_inh, self.n_v1_exc), dtype=np.float32)
 
-        # For each hypercolumn - implement winner-take-all through uniform lateral inhibition
-        # NO HARDCODING of orientation preferences!
+        # Architecture: Within each hypercolumn, we assign inhibitory neurons
+        # to ensembles. Each I neuron receives from "its" ensemble and
+        # suppresses COMPETING ensembles (cross-inhibition).
+        # This is orientation-agnostic: ensemble 0 competes with 1,2,3...7 equally.
+
         for hc_idx in range(self.n_hypercolumns):
-            # Get all neurons in this hypercolumn
-            exc_in_hc = self.exc_idx[hc_idx, :, :].flatten()
-            inh_in_hc = self.inh_idx[hc_idx, :].flatten()
+            inh_in_hc = self.inh_idx[hc_idx, :].flatten()  # 8 inhibitory neurons
+            n_inh_per_hc = len(inh_in_hc)
 
-            # E -> E: NO direct excitatory connections between ensembles
-            # This forces competition - ensembles must differentiate through STDP alone
-            # (Remove lateral excitation to make competition cleaner)
+            for ori_idx in range(self.n_orientations):
+                # Get excitatory neurons in this ensemble
+                exc_in_ens = self.exc_idx[hc_idx, ori_idx, :].flatten()
 
-            # E -> I: ALL excitatory neurons drive inhibitory neurons (uniform)
-            for e_idx in exc_in_hc:
-                for i_idx in inh_in_hc:
+                # Assign inhibitory neuron(s) to this ensemble
+                # Each orientation gets one inhibitory neuron
+                i_neuron_idx = ori_idx % n_inh_per_hc
+                i_idx = inh_in_hc[i_neuron_idx]
+
+                # E -> I: This ensemble drives its inhibitory neuron
+                for e_idx in exc_in_ens:
                     if np.random.random() < P_V1_LATERAL_INH:
                         self.w_exc_inh[e_idx, i_idx] = W_V1_EXC_LOCAL * (0.8 + 0.4 * np.random.random())
 
-            # I -> E: ALL inhibitory neurons suppress ALL excitatory neurons (uniform)
-            # This creates winner-take-all: most active ensemble suppresses others
-            for i_idx in inh_in_hc:
-                for e_idx in exc_in_hc:
-                    if np.random.random() < P_V1_LATERAL_INH:
-                        self.w_inh_exc[i_idx, e_idx] = W_V1_INH * (0.8 + 0.4 * np.random.random())
+                # I -> E: This inhibitory neuron suppresses OTHER ensembles
+                for other_ori in range(self.n_orientations):
+                    if other_ori == ori_idx:
+                        continue  # Don't suppress own ensemble
+                    other_exc = self.exc_idx[hc_idx, other_ori, :].flatten()
+                    for e_idx in other_exc:
+                        if np.random.random() < P_V1_LATERAL_INH:
+                            self.w_inh_exc[i_idx, e_idx] = W_V1_INH * (0.8 + 0.4 * np.random.random())
 
         # Convert to GPU
         self.w_exc_exc = to_gpu(self.w_exc_exc)
@@ -345,35 +370,60 @@ class VisualCortexNetwork:
         self.lgn_delay_buffer.add_spikes(lgn_spikes)
 
         # === V1 Processing ===
-        # Get delayed LGN spikes (using pre-computed average delay)
-        delayed_lgn_spikes = self.lgn_delay_buffer.get_delayed_spikes(
+        # Get previous timestep's spikes for recurrent processing
+        prev_v1_exc_spikes = self.v1_exc.spikes.copy()
+        prev_v1_inh_spikes = self.v1_inh.spikes.copy()
+
+        # FIRST: Apply inhibition from previous timestep (critical for winner-take-all!)
+        if xp.any(prev_v1_inh_spikes):
+            self.v1_exc.receive_spikes(self.w_inh_exc, prev_v1_inh_spikes, excitatory=False)
+
+        # Apply E->E lateral excitation from previous timestep
+        if xp.any(prev_v1_exc_spikes):
+            self.v1_exc.receive_spikes(self.w_exc_exc, prev_v1_exc_spikes, excitatory=True)
+
+        # Feedforward input to V1 excitatory with per-ensemble delays
+        # Each ensemble has a different characteristic delay, creating temporal diversity
+        weights = self.lgn_v1_stdp.weights
+
+        # Group V1 neurons by their delay to minimize buffer lookups
+        unique_delays = np.unique(self.v1_input_delays)
+
+        for delay_val in unique_delays:
+            # Get V1 neurons with this delay
+            delay_mask = self.v1_input_delays == delay_val
+            v1_indices = np.where(delay_mask)[0]
+
+            # Get LGN spikes delayed by this amount
+            delay_array = xp.full(len(lgn_spikes), delay_val, dtype=xp.float32)
+            delayed_lgn_spikes = self.lgn_delay_buffer.get_delayed_spikes(delay_array)
+
+            # Apply input only to these V1 neurons
+            if xp.any(delayed_lgn_spikes):
+                # Compute conductance change for these neurons
+                subset_weights = weights[:, v1_indices]
+                g_input = xp.dot(delayed_lgn_spikes.astype(xp.float32), subset_weights)
+                self.v1_exc.g_exc[v1_indices] += to_gpu(g_input) if GPU_AVAILABLE else g_input
+
+        # Store the last delayed spikes for STDP (use average delay)
+        self.last_delayed_lgn_spikes = self.lgn_delay_buffer.get_delayed_spikes(
             self.avg_lgn_v1_delays
         )
 
-        # Feedforward input to V1 excitatory
-        weights = self.lgn_v1_stdp.weights
-        self.v1_exc.receive_spikes(weights, delayed_lgn_spikes, excitatory=True)
+        # Step V1 excitatory (with inhibition already applied)
+        v1_exc_spikes = self.v1_exc.step(t, dt)
 
-        # V1 lateral connections
-        v1_exc_spikes = self.v1_exc.spikes
-
-        # E -> E and E -> I
+        # E -> I: excitatory spikes drive inhibitory neurons
         if xp.any(v1_exc_spikes):
-            self.v1_exc.receive_spikes(self.w_exc_exc, v1_exc_spikes, excitatory=True)
             self.v1_inh.receive_spikes(self.w_exc_inh, v1_exc_spikes, excitatory=True)
 
-        # Step V1 populations
-        v1_exc_spikes = self.v1_exc.step(t, dt)
+        # Step V1 inhibitory
         v1_inh_spikes = self.v1_inh.step(t, dt)
-
-        # I -> E
-        if xp.any(v1_inh_spikes):
-            self.v1_exc.receive_spikes(self.w_inh_exc, v1_inh_spikes, excitatory=False)
 
         # === Learning (STDP) ===
         if learning:
             # LGN -> V1 excitatory STDP
-            self.lgn_v1_stdp.update(delayed_lgn_spikes, v1_exc_spikes, dt)
+            self.lgn_v1_stdp.update(self.last_delayed_lgn_spikes, v1_exc_spikes, dt)
 
             # Inhibitory STDP for homeostasis
             self.inh_stdp.update(v1_inh_spikes, v1_exc_spikes, dt, learning_rate=0.5)
