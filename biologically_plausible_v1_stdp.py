@@ -3,14 +3,25 @@
 
 RGC -> LGN -> V1(L4) spiking network with STDP that learns orientation selectivity.
 
-BIOLOGICAL PLAUSIBILITY IMPROVEMENTS:
-1. Izhikevich neurons replace LIF neurons (proper parameters for each cell type)
-2. Local PV/SOM interneuron circuits replace global inhibition
-3. Homeostatic synaptic scaling replaces global weight normalization
-4. Triplet STDP rule for more realistic plasticity
-5. Lateral connectivity between ensembles (excitatory and inhibitory)
+BIOLOGICAL PLAUSIBILITY FEATURES:
+1. Izhikevich neurons (proper parameters for each cell type)
+2. Explicit inhibitory interneurons (PV for feedforward, SOM for lateral)
+3. Mexican-hat / ring lateral inhibition (distance-dependent via SOM)
+4. Homeostatic synaptic scaling (multiplicative, replaces hard normalization)
+5. Triplet STDP rule for more realistic plasticity
+6. Lateral excitatory connectivity (Gaussian profile)
 
-Neuron types and their Izhikevich parameters (from Izhikevich 2003, 2007):
+Inhibitory circuits:
+- PV interneurons: Fast-spiking, receive local excitation, provide feedforward inhibition
+- SOM interneurons: Low-threshold spiking, provide Mexican-hat lateral inhibition
+  (peak inhibition at intermediate orientation distances, creates surround suppression)
+
+Homeostatic mechanisms (Turrigiano 2008, 2012):
+- Rate-based multiplicative scaling: neurons adjust weights to maintain target rate
+- Soft weight normalization: gradual pull toward target total synaptic weight
+  (models heterosynaptic plasticity / competition for limited resources)
+
+Neuron types and Izhikevich parameters (from Izhikevich 2003, 2007):
 - Thalamocortical (TC) LGN: a=0.02, b=0.25, c=-65, d=0.05 (rebound bursting)
 - Regular Spiking (RS) V1 excitatory: a=0.02, b=0.2, c=-65, d=8
 - Fast Spiking (FS) PV interneurons: a=0.1, b=0.2, c=-65, d=2
@@ -19,7 +30,8 @@ Neuron types and their Izhikevich parameters (from Izhikevich 2003, 2007):
 References:
 - Izhikevich (2003) "Simple model of spiking neurons"
 - Izhikevich (2007) "Dynamical Systems in Neuroscience"
-- Turrigiano (2008) "Homeostatic synaptic plasticity"
+- Turrigiano (2008) "The self-tuning neuron: synaptic scaling of excitatory synapses"
+- Turrigiano (2012) "Homeostatic synaptic plasticity: local and global mechanisms"
 - Pfister & Gerstner (2006) "Triplets of spikes in STDP"
 
 License: MIT
@@ -109,9 +121,9 @@ class Params:
     w_max: float = 1.0
 
     # Homeostatic synaptic scaling (replaces global normalization)
-    target_rate_hz: float = 8.0  # Target firing rate for homeostasis
-    tau_homeostasis: float = 5000.0  # Time constant for homeostasis (ms)
-    homeostasis_rate: float = 0.001  # Learning rate for homeostasis
+    target_rate_hz: float = 5.0  # Target firing rate for homeostasis
+    tau_homeostasis: float = 1000.0  # Time constant for homeostasis (ms)
+    homeostasis_rate: float = 0.01  # Learning rate for homeostasis
 
     # STDP parameters (pair-based with triplet enhancement)
     # Time constants matched to original working code
@@ -138,8 +150,10 @@ class Params:
     w_pv_e: float = 3.0
     # E->SOM (lateral inhibition drive from this ensemble)
     w_e_som: float = 6.0
-    # SOM->E (lateral inhibition TO OTHER ensembles - NOT self)
-    w_som_e: float = 3.0
+    # SOM->E (lateral inhibition with Mexican-hat profile)
+    w_som_e: float = 4.0  # Peak inhibition strength
+    som_inhibit_peak: float = 2.0  # Distance (in ensemble units) at which inhibition peaks
+    som_inhibit_sigma: float = 1.5  # Width of the ring of inhibition
 
     # Lateral excitatory connections (between nearby ensembles)
     w_e_e_lateral: float = 0.5
@@ -312,11 +326,11 @@ class HomeostaticScaling:
     """
     Biologically plausible homeostatic synaptic scaling.
 
-    Based on Turrigiano (2008): neurons slowly adjust their synaptic
-    strengths to maintain a target firing rate. This is a LOCAL mechanism
-    that operates on each neuron independently.
+    Combines two mechanisms observed experimentally (Turrigiano 2008, 2012):
+    1. Firing rate homeostasis: Multiplicative scaling based on activity level
+    2. Heterosynaptic plasticity: Soft normalization of total synaptic weight
 
-    The scaling is multiplicative: w <- w * (1 + eta * (r_target - r_actual))
+    Both operate slowly compared to STDP, providing stable learning.
     """
 
     def __init__(self, n_post: int, p: Params):
@@ -337,18 +351,48 @@ class HomeostaticScaling:
         instant_rate = spikes.astype(np.float32) * (1000.0 / dt_ms)  # Convert to Hz
         self.rate_avg = self.decay * self.rate_avg + (1 - self.decay) * instant_rate
 
-    def get_scaling_factors(self) -> np.ndarray:
+    def apply_scaling(self, W: np.ndarray, w_max: float) -> np.ndarray:
         """
-        Get multiplicative scaling factors for each neuron's input weights.
+        Apply homeostatic scaling to weights.
 
-        Returns: (n_post,) array of scaling factors
+        Combines:
+        1. Rate-based multiplicative scaling (neurons firing too fast reduce weights)
+        2. Soft weight normalization (gradual pull toward target sum)
+
+        This is more biologically realistic than hard normalization while
+        still providing the necessary constraint for STDP to work.
+
+        Args:
+            W: (n_post, n_pre) weight matrix
+            w_max: maximum weight value
+
+        Returns: scaled weight matrix
         """
         p = self.p
-        # Error signal: positive if firing too slow, negative if too fast
+
+        # 1. Rate-based homeostatic scaling (Turrigiano 2008)
+        # Neurons firing above target reduce all their input weights
+        # Neurons firing below target increase all their input weights
         error = p.target_rate_hz - self.rate_avg
-        # Multiplicative scaling factor
-        scale = 1.0 + p.homeostasis_rate * error
-        return np.clip(scale, 0.95, 1.05)  # Limit rate of change
+        rate_scale = 1.0 + p.homeostasis_rate * error
+        rate_scale = np.clip(rate_scale, 0.95, 1.05)
+
+        # Apply rate-based scaling
+        W_scaled = W * rate_scale[:, None]
+
+        # 2. Soft weight normalization (heterosynaptic plasticity)
+        # Gradually pull total synaptic weight toward target
+        # This models competition for limited resources (receptor slots, proteins)
+        w_sum = W_scaled.sum(axis=1, keepdims=True) + 1e-6
+        target_ratio = p.w_norm_target / w_sum
+
+        # Soft pull: blend current with target (slower than hard normalization)
+        # alpha=0.1 means 10% pull toward target per segment
+        alpha = 0.1
+        blend_factor = alpha * target_ratio + (1 - alpha) * 1.0
+        W_scaled = W_scaled * blend_factor
+
+        return np.clip(W_scaled, 0.0, w_max)
 
 
 class RgcLgnV1Network:
@@ -450,16 +494,24 @@ class RgcLgnV1Network:
             som_end = som_start + p.n_som_per_ensemble
             self.W_e_som[som_start:som_end, m] = p.w_e_som
 
-        # SOM->E connectivity (LATERAL inhibition - inhibits OTHER ensembles)
-        # SOM neuron m inhibits all ensembles EXCEPT ensemble m
-        # This creates competition: when ensemble m fires, it inhibits others
+        # SOM->E connectivity (Mexican-hat / ring lateral inhibition)
+        # SOM neuron m inhibits other ensembles with distance-dependent strength
+        # Peak inhibition at intermediate distances, weaker at close and far distances
+        # This creates surround suppression typical of cortical circuits
         self.W_som_e = np.zeros((p.M, self.n_som), dtype=np.float32)
         for m in range(p.M):
             som_start = m * p.n_som_per_ensemble
             som_end = som_start + p.n_som_per_ensemble
             for other in range(p.M):
-                if other != m:  # Inhibit others, NOT self
-                    self.W_som_e[other, som_start:som_end] = p.w_som_e / (p.M - 1)
+                if other != m:  # No self-inhibition
+                    # Circular distance on the ring of orientations
+                    d = min(abs(other - m), p.M - abs(other - m))
+                    # Mexican-hat/ring profile: peaks at som_inhibit_peak distance
+                    # w(d) = w_peak * exp(-(d - d_peak)^2 / (2*sigma^2))
+                    ring_weight = p.w_som_e * math.exp(
+                        -(d - p.som_inhibit_peak)**2 / (2 * p.som_inhibit_sigma**2)
+                    )
+                    self.W_som_e[other, som_start:som_end] = ring_weight
 
         # --- Lateral excitatory connectivity ---
         # Gaussian connectivity based on ensemble distance (circular topology)
@@ -598,9 +650,7 @@ class RgcLgnV1Network:
 
     def apply_homeostasis(self):
         """Apply homeostatic scaling to weights (call periodically, not every step)."""
-        scale = self.homeostasis.get_scaling_factors()
-        self.W *= scale[:, None]
-        np.clip(self.W, 0.0, self.p.w_max, out=self.W)
+        self.W = self.homeostasis.apply_scaling(self.W, self.p.w_max)
 
     def run_segment(self, theta_deg: float, plastic: bool) -> np.ndarray:
         """Run one stimulus segment and return V1 spike counts."""
@@ -614,13 +664,11 @@ class RgcLgnV1Network:
             on_spk, off_spk = self.rgc_spikes(stim)
             v1_counts += self.step(on_spk, off_spk, plastic=plastic)
 
-        # Apply weight normalization at end of segment
-        # This models homeostatic synaptic scaling which operates on slower timescales
+        # Apply homeostatic synaptic scaling at end of segment
+        # This is biologically realistic: neurons slowly adjust their synaptic
+        # strengths to maintain a target firing rate (Turrigiano 2008)
         if plastic:
-            # Normalize total input weight per neuron (heterosynaptic plasticity)
-            w_sum = self.W.sum(axis=1, keepdims=True) + 1e-6
-            self.W *= (p.w_norm_target / w_sum)
-            np.clip(self.W, 0.0, p.w_max, out=self.W)
+            self.apply_homeostasis()
 
         return v1_counts
 
@@ -801,8 +849,8 @@ def main() -> None:
     print(f"[init] Biologically plausible RGC->LGN->V1 network")
     print(f"[init] N={p.N} (patch), M={p.M} (ensembles), n_lgn={net.n_lgn}")
     print(f"[init] Neuron types: LGN=TC(Izhikevich), V1=RS, PV=FS, SOM=LTS")
-    print(f"[init] Plasticity: Triplet STDP + Homeostatic scaling")
-    print(f"[init] Inhibition: Local PV (feedforward) + SOM (lateral)")
+    print(f"[init] Plasticity: Triplet STDP + Homeostatic synaptic scaling")
+    print(f"[init] Inhibition: PV (feedforward) + SOM (Mexican-hat lateral)")
     print(f"[init] init-mode = {args.init_mode}")
 
     thetas = np.linspace(0, 180 - 180 / args.eval_K, args.eval_K)
