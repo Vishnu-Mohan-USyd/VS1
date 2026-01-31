@@ -117,7 +117,7 @@ class Params:
     # LGN->V1 weights & delays
     delay_max: int = 12
     w_init_mean: float = 0.25  # Scaled for Izhikevich (total input ~15-30 pA)
-    w_init_std: float = 0.12  # Increased variance for diverse starting conditions
+    w_init_std: float = 0.08
     w_max: float = 1.0
 
     # Homeostatic synaptic scaling (replaces global normalization)
@@ -131,9 +131,9 @@ class Params:
     tau_minus: float = 20.0  # Post-before-pre time constant
     tau_x: float = 101.0     # Slow pre trace for triplet
     tau_y: float = 125.0     # Slow post trace for triplet
-    A2_plus: float = 0.008   # Pair LTP amplitude (matches original)
-    A3_plus: float = 0.002   # Triplet LTP enhancement
-    A2_minus: float = 0.010  # Pair LTD amplitude (matches original)
+    A2_plus: float = 0.006   # Pair LTP amplitude (reduced for stability)
+    A3_plus: float = 0.0015  # Triplet LTP enhancement
+    A2_minus: float = 0.005  # Pair LTD amplitude (slightly weaker than LTP)
     A3_minus: float = 0.0    # Triplet LTD amplitude (often 0)
 
     # Weight decay and normalization (biologically: synaptic turnover)
@@ -151,7 +151,7 @@ class Params:
     # E->SOM (lateral inhibition drive from this ensemble)
     w_e_som: float = 6.0
     # SOM->E (lateral inhibition with Mexican-hat profile)
-    w_som_e: float = 2.5  # Peak inhibition strength (reduced to allow more neurons to learn)
+    w_som_e: float = 4.0  # Peak inhibition strength
     som_inhibit_peak: float = 2.0  # Distance (in ensemble units) at which inhibition peaks
     som_inhibit_sigma: float = 1.5  # Width of the ring of inhibition
 
@@ -355,12 +355,12 @@ class HomeostaticScaling:
         """
         Apply homeostatic scaling to weights.
 
-        Combines:
-        1. Rate-based multiplicative scaling (neurons firing too fast reduce weights)
-        2. Soft weight normalization (gradual pull toward target sum)
+        Uses GATED homeostatic scaling: only applies corrections when neurons
+        are significantly outside the target range. This prevents the constant
+        push-pull that can destabilize learning.
 
-        This is more biologically realistic than hard normalization while
-        still providing the necessary constraint for STDP to work.
+        Based on Turrigiano's observation that homeostatic mechanisms primarily
+        activate during substantial activity perturbations.
 
         Args:
             W: (n_post, n_pre) weight matrix
@@ -370,25 +370,34 @@ class HomeostaticScaling:
         """
         p = self.p
 
-        # 1. Rate-based homeostatic scaling (Turrigiano 2008)
-        # Neurons firing above target reduce all their input weights
-        # Neurons firing below target increase all their input weights
+        # Gated rate-based homeostatic scaling
+        # Only apply scaling when rate is outside a "dead zone" around target
+        # Dead zone: [target * 0.3, target * 2.5] - neurons in this range are left alone
+        rate_low = p.target_rate_hz * 0.3   # 1.5 Hz
+        rate_high = p.target_rate_hz * 2.5  # 12.5 Hz
+
         error = p.target_rate_hz - self.rate_avg
-        rate_scale = 1.0 + p.homeostasis_rate * error
-        rate_scale = np.clip(rate_scale, 0.95, 1.05)
+        rate_scale = np.ones(self.n_post, dtype=np.float32)
+
+        # Only scale neurons outside the dead zone
+        too_low = self.rate_avg < rate_low
+        too_high = self.rate_avg > rate_high
+
+        # Stronger correction for neurons that are way off
+        rate_scale[too_low] = 1.0 + p.homeostasis_rate * 2.0 * error[too_low]
+        rate_scale[too_high] = 1.0 + p.homeostasis_rate * error[too_high]
+        rate_scale = np.clip(rate_scale, 0.90, 1.10)
 
         # Apply rate-based scaling
         W_scaled = W * rate_scale[:, None]
 
-        # 2. Soft weight normalization (heterosynaptic plasticity)
-        # Gradually pull total synaptic weight toward target
-        # This models competition for limited resources (receptor slots, proteins)
+        # Soft weight normalization (heterosynaptic plasticity)
+        # Keep alpha very gentle to preserve established selectivity
         w_sum = W_scaled.sum(axis=1, keepdims=True) + 1e-6
         target_ratio = p.w_norm_target / w_sum
 
-        # Soft pull: blend current with target (slower than hard normalization)
-        # alpha=0.1 means 10% pull toward target per segment
-        alpha = 0.1
+        # Soft pull: alpha=0.05 for minimal interference with STDP
+        alpha = 0.05
         blend_factor = alpha * target_ratio + (1 - alpha) * 1.0
         W_scaled = W_scaled * blend_factor
 
