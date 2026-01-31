@@ -1,0 +1,8 @@
+numpy>=1.20.0
+matplotlib>=3.4.0
+scipy>=1.7.0
+tqdm>=4.60.0
+
+# Optional: GPU acceleration (install separately based on your CUDA version)
+# cupy-cuda11x  # For CUDA 11.x
+# cupy-cuda12x  # For CUDA 12.x
