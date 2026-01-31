@@ -130,16 +130,16 @@ class Params:
 
     # Local inhibitory circuit parameters
     n_pv_per_ensemble: int = 1  # PV interneurons per ensemble
-    n_som: int = 2  # SOM interneurons for lateral inhibition
+    n_som_per_ensemble: int = 1  # SOM interneurons per ensemble for lateral inhibition
 
     # E->PV (feedforward inhibition) - scaled for Izhikevich
     w_e_pv: float = 5.0
     # PV->E (feedback inhibition, local)
     w_pv_e: float = 3.0
-    # E->SOM (lateral inhibition drive)
-    w_e_som: float = 4.0
-    # SOM->E (lateral inhibition, to other ensembles)
-    w_som_e: float = 2.5
+    # E->SOM (lateral inhibition drive from this ensemble)
+    w_e_som: float = 6.0
+    # SOM->E (lateral inhibition TO OTHER ensembles - NOT self)
+    w_som_e: float = 3.0
 
     # Lateral excitatory connections (between nearby ensembles)
     w_e_e_lateral: float = 0.5
@@ -257,12 +257,17 @@ class TripletSTDP:
         """
         Update traces and compute MULTIPLICATIVE weight changes.
 
-        Uses multiplicative STDP where:
-        - LTD is proportional to current weight (stronger synapses weaken more)
-        - LTP is proportional to (w_max - W) (weaker synapses strengthen more)
+        CRITICAL: Order of operations matches original working code:
+        1. Decay traces
+        2. LTD: when pre arrives, depress based on OLD post trace
+        3. Update pre traces (so current arrivals are included)
+        4. LTP: when post fires, potentiate based on NEW pre trace (includes current arrivals)
+        5. Update post traces
+
+        This order ensures that coincident pre-post activity within the same timestep
+        contributes to LTP, which is essential for proper orientation selectivity learning.
 
         arrivals: (n_post, n_pre) - which pre-spikes arrived at each synapse this timestep
-                  This is DIFFERENT for each post neuron due to axonal delays!
         post_spikes: (n_post,) binary
         W: (n_post, n_pre) current weights
 
@@ -278,12 +283,17 @@ class TripletSTDP:
 
         dW = np.zeros_like(W)
 
-        # LTD: When pre spike arrives, depress based on post trace
+        # LTD: When pre spike arrives, depress based on post trace (OLD, before this spike)
         # Multiplicative: dW- proportional to W (stronger synapses lose more)
         if arrivals.any():
             dW -= p.A2_minus * arrivals * self.x_post[:, None] * W
 
-        # LTP: When post fires, potentiate based on pre trace
+        # Update pre traces BEFORE computing LTP
+        # This ensures current arrivals contribute to LTP if post fires this timestep
+        self.x_pre += arrivals
+        self.x_pre_slow += arrivals
+
+        # LTP: When post fires, potentiate based on pre trace (NEW, includes current arrivals)
         # Multiplicative: dW+ proportional to (w_max - W) (room to grow)
         # Triplet enhancement: stronger LTP when there's recent post activity
         if post_spikes.any():
@@ -291,12 +301,7 @@ class TripletSTDP:
             triplet_boost = 1.0 + p.A3_plus * self.x_post_slow[:, None] / p.A2_plus
             dW += p.A2_plus * post_mask[:, None] * self.x_pre * (p.w_max - W) * triplet_boost
 
-        # Update traces AFTER computing plasticity
-        # Pre arrival -> increment pre traces for those synapses
-        self.x_pre += arrivals
-        self.x_pre_slow += arrivals
-
-        # Post spike -> increment post traces
+        # Update post traces AFTER computing plasticity
         self.x_post += post_spikes.astype(np.float32)
         self.x_post_slow += post_spikes.astype(np.float32)
 
@@ -384,14 +389,15 @@ class RgcLgnV1Network:
         self.pv = IzhikevichPopulation(self.n_pv, FS_PARAMS, p.dt_ms, self.rng)
 
         # --- SOM Interneurons (Low-threshold spiking) ---
-        # Shared SOM neurons for lateral inhibition between ensembles
-        self.som = IzhikevichPopulation(p.n_som, LTS_PARAMS, p.dt_ms, self.rng)
+        # Each ensemble has its own SOM neuron for lateral inhibition
+        self.n_som = p.M * p.n_som_per_ensemble
+        self.som = IzhikevichPopulation(self.n_som, LTS_PARAMS, p.dt_ms, self.rng)
 
         # --- Synaptic currents ---
         self.I_lgn = np.zeros(self.n_lgn, dtype=np.float32)
         self.I_v1 = np.zeros(p.M, dtype=np.float32)
         self.I_pv = np.zeros(self.n_pv, dtype=np.float32)
-        self.I_som = np.zeros(p.n_som, dtype=np.float32)
+        self.I_som = np.zeros(self.n_som, dtype=np.float32)
 
         # Synaptic decays
         self.decay_ampa = math.exp(-p.dt_ms / p.tau_ampa)
@@ -436,12 +442,24 @@ class RgcLgnV1Network:
             pv_end = pv_start + p.n_pv_per_ensemble
             self.W_pv_e[m, pv_start:pv_end] = p.w_pv_e
 
-        # E->SOM connectivity (all excitatory neurons drive SOM)
-        self.W_e_som = np.full((p.n_som, p.M), p.w_e_som / p.M, dtype=np.float32)
+        # E->SOM connectivity (each ensemble drives its own SOM neuron)
+        # This is local - ensemble m drives SOM neuron m
+        self.W_e_som = np.zeros((self.n_som, p.M), dtype=np.float32)
+        for m in range(p.M):
+            som_start = m * p.n_som_per_ensemble
+            som_end = som_start + p.n_som_per_ensemble
+            self.W_e_som[som_start:som_end, m] = p.w_e_som
 
-        # SOM->E connectivity (lateral inhibition)
-        # SOM inhibits all ensembles, but each ensemble's local activity is spared
-        self.W_som_e = np.full((p.M, p.n_som), p.w_som_e / p.n_som, dtype=np.float32)
+        # SOM->E connectivity (LATERAL inhibition - inhibits OTHER ensembles)
+        # SOM neuron m inhibits all ensembles EXCEPT ensemble m
+        # This creates competition: when ensemble m fires, it inhibits others
+        self.W_som_e = np.zeros((p.M, self.n_som), dtype=np.float32)
+        for m in range(p.M):
+            som_start = m * p.n_som_per_ensemble
+            som_end = som_start + p.n_som_per_ensemble
+            for other in range(p.M):
+                if other != m:  # Inhibit others, NOT self
+                    self.W_som_e[other, som_start:som_end] = p.w_som_e / (p.M - 1)
 
         # --- Lateral excitatory connectivity ---
         # Gaussian connectivity based on ensemble distance (circular topology)
