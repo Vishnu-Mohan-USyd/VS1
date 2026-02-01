@@ -56,6 +56,32 @@ def compute_osi(rates_hz: np.ndarray, thetas_deg: np.ndarray) -> Tuple[np.ndarra
     pref = (0.5 * np.angle(vec)) % np.pi
     return osi, np.rad2deg(pref)
 
+def pref_diversity_metrics(pref_deg: np.ndarray, *, n_bins: int = 8) -> dict:
+    """Orientation-preference diversity metrics (on [0,180)).
+
+    Measures how well the ensembles cover the full orientation space.
+    """
+    pref = (np.asarray(pref_deg, dtype=np.float32) % 180.0)
+    bins = np.floor(pref / (180.0 / float(n_bins))).astype(int)
+    bins = np.clip(bins, 0, n_bins - 1)
+    unique_bins = int(np.unique(bins).size)
+
+    if pref.size < 2:
+        return {"unique_bins": unique_bins, "min_sep_deg": 0.0, "mean_sep_deg": 0.0}
+
+    diffs = []
+    for i in range(pref.size):
+        for j in range(i + 1, pref.size):
+            d = abs(float(pref[i]) - float(pref[j]))
+            d = min(d, 180.0 - d)
+            diffs.append(d)
+    diffs = np.array(diffs, dtype=np.float32)
+    return {
+        "unique_bins": unique_bins,
+        "min_sep_deg": float(diffs.min()) if diffs.size else 0.0,
+        "mean_sep_deg": float(diffs.mean()) if diffs.size else 0.0,
+    }
+
 
 # =============================================================================
 # Izhikevich Neuron Parameters (from literature)
@@ -87,6 +113,9 @@ class Params:
     M: int = 8  # Number of V1 ensembles (like a hypercolumn)
     dt_ms: float = 0.5  # Time step (smaller for Izhikevich stability)
 
+    # Stimulus sampling (reduces grid-aliasing bias without imposing orientation templates)
+    coord_jitter: float = 0.25  # random jitter added to each RGC position (pixel units)
+
     # Training
     segment_ms: int = 300
     train_segments: int = 200
@@ -105,7 +134,7 @@ class Params:
     # LGN->V1 weights & delays
     delay_max: int = 12
     w_init_mean: float = 0.25  # Scaled for Izhikevich (total input ~15-30 pA)
-    w_init_std: float = 0.08
+    w_init_std: float = 0.12  # Increased for more initial diversity
     w_max: float = 1.0
 
     # Homeostatic synaptic scaling (replaces global normalization)
@@ -139,7 +168,14 @@ class Params:
     # E->SOM (lateral inhibition drive from this ensemble)
     w_e_som: float = 6.0
     # SOM->E (lateral inhibition TO OTHER ensembles - NOT self)
-    w_som_e: float = 3.0
+    w_som_e: float = 6.0  # Moderate competition
+
+    # Lateral SOM inhibition profile (Mexican-hat via notch: weak near, strong far)
+    # This is the KEY mechanism for orientation diversity!
+    # Small sigma = sharp notch (neighbors get weak inhibition, distant get strong)
+    # Large sigma = gentle notch (more uniform inhibition)
+    # sigma=0 or very large = uniform inhibition (all non-self ensembles inhibited equally)
+    som_notch_sigma: float = 1.0
 
     # Lateral excitatory connections (between nearby ensembles)
     w_e_e_lateral: float = 0.5
@@ -372,10 +408,16 @@ class RgcLgnV1Network:
         self.M = p.M  # Number of V1 ensembles
         self.L = p.delay_max + 1  # Delay buffer length
 
-        # Spatial coordinates for stimulus
+        # Spatial coordinates for stimulus (with small random jitter to reduce grid-aliasing bias)
         xs = np.arange(p.N) - (p.N - 1) / 2.0
         ys = np.arange(p.N) - (p.N - 1) / 2.0
         self.X, self.Y = np.meshgrid(xs, ys, indexing="xy")
+        if p.coord_jitter > 0:
+            self.X = (self.X + self.rng.uniform(-p.coord_jitter, p.coord_jitter, size=self.X.shape)).astype(np.float32)
+            self.Y = (self.Y + self.rng.uniform(-p.coord_jitter, p.coord_jitter, size=self.Y.shape)).astype(np.float32)
+        else:
+            self.X = self.X.astype(np.float32)
+            self.Y = self.Y.astype(np.float32)
 
         # --- LGN Layer (Thalamocortical neurons) ---
         self.lgn = IzhikevichPopulation(self.n_lgn, TC_PARAMS, p.dt_ms, self.rng)
@@ -450,16 +492,45 @@ class RgcLgnV1Network:
             som_end = som_start + p.n_som_per_ensemble
             self.W_e_som[som_start:som_end, m] = p.w_e_som
 
-        # SOM->E connectivity (LATERAL inhibition - inhibits OTHER ensembles)
-        # SOM neuron m inhibits all ensembles EXCEPT ensemble m
-        # This creates competition: when ensemble m fires, it inhibits others
+        # SOM->E connectivity (LATERAL inhibition with distance-dependent notch profile)
+        # KEY MECHANISM FOR ORIENTATION DIVERSITY!
+        #
+        # Each ensemble has its own SOM neuron driven locally (E->SOM), then projecting broadly.
+        # We distribute the SOM inhibitory "budget" across ensembles with a distance-dependent NOTCH:
+        #   profile(d) = 1 - exp(-d²/(2*sigma_notch²))
+        # which is WEAK for near neighbors and STRONGER for distant targets.
+        #
+        # This creates the crucial Mexican-hat-like competition:
+        # - Nearby ensembles can develop similar orientation preferences (weak mutual inhibition)
+        # - Distant ensembles are pushed to develop different preferences (strong mutual inhibition)
+        #
+        # Biology: This mimics the effect of long-range suppressive interactions identified
+        # by Kaschube et al. (2010) as necessary for universal pinwheel density of π.
         self.W_som_e = np.zeros((p.M, self.n_som), dtype=np.float32)
+        sigma = float(max(1e-3, p.som_notch_sigma))
         for m in range(p.M):
             som_start = m * p.n_som_per_ensemble
             som_end = som_start + p.n_som_per_ensemble
+
+            # Compute distance-dependent profile for this SOM's inhibition targets
+            prof = np.zeros(p.M, dtype=np.float32)
             for other in range(p.M):
-                if other != m:  # Inhibit others, NOT self
-                    self.W_som_e[other, som_start:som_end] = p.w_som_e / (p.M - 1)
+                if other == m:
+                    prof[other] = 0.0  # No self-inhibition
+                else:
+                    # Ring distance (circular topology)
+                    d = abs(other - m)
+                    d = min(d, p.M - d)
+                    # Notch profile: weak near, strong far
+                    prof[other] = 1.0 - math.exp(-(d * d) / (2.0 * sigma * sigma))
+
+            # Normalize to preserve total inhibition budget
+            s = float(prof.sum()) + 1e-6
+            prof = (p.w_som_e * prof / s).astype(np.float32)
+
+            # Assign same profile to all SOM neurons in this ensemble
+            for som_k in range(som_start, som_end):
+                self.W_som_e[:, som_k] = prof
 
         # --- Lateral excitatory connectivity ---
         # Gaussian connectivity based on ensemble distance (circular topology)
@@ -749,6 +820,26 @@ def plot_scalar_over_time(xs: np.ndarray, ys: np.ndarray, outpath: str,
     fig.savefig(outpath, dpi=150)
     plt.close(fig)
 
+def plot_pref_map(pref_deg: np.ndarray, M: int, outpath: str, title: str) -> None:
+    """Ring plot of preferred orientation across the hypercolumn ensembles.
+
+    This visualizes how well the ensembles cover the orientation space.
+    Ideally, the colors should span the full range (all orientations represented).
+    """
+    pref = (np.asarray(pref_deg, dtype=np.float32) % 180.0)
+    angles = np.linspace(0, 2 * np.pi, M, endpoint=False)
+    r = np.ones(M, dtype=np.float32)
+    fig = plt.figure(figsize=(4.5, 4.0))
+    ax = fig.add_subplot(111, projection="polar")
+    sc = ax.scatter(angles, r, c=pref, vmin=0.0, vmax=180.0, s=80, cmap='hsv')
+    ax.set_yticks([])
+    ax.set_title(title)
+    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.08)
+    cbar.set_label("pref (deg)")
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
 
 def plot_interneuron_activity(pv_rates: List[float], som_rates: List[float],
                               segments: List[int], outpath: str) -> None:
@@ -782,6 +873,10 @@ def main() -> None:
     ap.add_argument("--eval-K", type=int, default=12, help="Number of orientations to test")
     ap.add_argument("--eval-repeats", type=int, default=3)
     ap.add_argument("--baseline-repeats", type=int, default=7)
+    ap.add_argument("--coord-jitter", type=float, default=0.25, help="RGC position jitter (pixel units)")
+    ap.add_argument("--som-notch-sigma", type=float, default=1.0, help="Notch width for SOM lateral inhibition profile")
+    ap.add_argument("--div-bins", type=int, default=8, help="Bins for diversity metric")
+
     ap.add_argument("--init-mode", type=str, default="random",
                     choices=["random", "near_uniform"])
 
@@ -792,6 +887,8 @@ def main() -> None:
     p = Params(
         N=args.N,
         M=args.M,
+        coord_jitter=float(args.coord_jitter),
+        som_notch_sigma=float(args.som_notch_sigma),
         seed=args.seed,
         train_segments=args.train_segments,
         segment_ms=args.segment_ms
@@ -812,7 +909,8 @@ def main() -> None:
     rates0 = net.evaluate_tuning(thetas, repeats=args.baseline_repeats)
     osi0, pref0 = compute_osi(rates0, thetas)
 
-    print(f"[seg {0:4d}] mean rate={rates0.mean():.3f} Hz | mean OSI={osi0.mean():.3f} | max OSI={osi0.max():.3f}")
+    d0 = pref_diversity_metrics(pref0, n_bins=int(args.div_bins))
+    print(f"[seg {0:4d}] mean rate={rates0.mean():.3f} Hz | mean OSI={osi0.mean():.3f} | max OSI={osi0.max():.3f} | pref_bins={d0['unique_bins']}/{int(args.div_bins)} | min_sep={d0['min_sep_deg']:.1f}deg")
     print(f"          prefs(deg) = {np.round(pref0, 1)}")
     print("          NOTE: Nonzero OSI at init is expected from random RF structure")
 
@@ -845,7 +943,8 @@ def main() -> None:
             rates = net.evaluate_tuning(thetas, repeats=args.eval_repeats)
             osi, pref = compute_osi(rates, thetas)
 
-            print(f"[seg {s:4d}] mean rate={rates.mean():.3f} Hz | mean OSI={osi.mean():.3f} | max OSI={osi.max():.3f}")
+            d = pref_diversity_metrics(pref, n_bins=int(args.div_bins))
+            print(f"[seg {s:4d}] mean rate={rates.mean():.3f} Hz | mean OSI={osi.mean():.3f} | max OSI={osi.max():.3f} | pref_bins={d['unique_bins']}/{int(args.div_bins)} | min_sep={d['min_sep_deg']:.1f}deg")
             print(f"          prefs(deg) = {np.round(pref, 1)}")
 
             plot_weight_maps(net.W, p.N,
@@ -866,7 +965,8 @@ def main() -> None:
     osi1, pref1 = compute_osi(rates1, thetas)
 
     d_osi = osi1 - osi0
-    print(f"[final] baseline mean OSI={osi0.mean():.3f} -> final mean OSI={osi1.mean():.3f} (delta={d_osi.mean():+.3f})")
+    d1 = pref_diversity_metrics(pref1, n_bins=int(args.div_bins))
+    print(f"[final] baseline mean OSI={osi0.mean():.3f} -> final mean OSI={osi1.mean():.3f} (delta={d_osi.mean():+.3f}) | pref_bins={d1['unique_bins']}/{int(args.div_bins)} | min_sep={d1['min_sep_deg']:.1f}deg")
     print(f"[final] fraction ensembles with OSI>0.3: {(osi1>0.3).mean()*100:.1f}%")
     print(f"[final] fraction ensembles with OSI>0.5: {(osi1>0.5).mean()*100:.1f}%")
 
