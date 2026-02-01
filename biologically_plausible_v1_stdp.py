@@ -119,6 +119,7 @@ class Params:
     # Training
     segment_ms: int = 300
     train_segments: int = 200
+    wave_segments: int = 50  # Pre-training with retinal waves
     seed: int = 1
 
     # Drifting gratings
@@ -176,6 +177,26 @@ class Params:
     # Large sigma = gentle notch (more uniform inhibition)
     # sigma=0 or very large = uniform inhibition (all non-self ensembles inhibited equally)
     som_notch_sigma: float = 1.0
+
+    # Anti-Hebbian lateral inhibition plasticity (Foldiak 1990)
+    # Makes SOM->E weights plastic: ensembles that fire together inhibit each other more
+    # Use mild parameters to avoid suppressing learning
+    anti_hebbian_eta: float = 0.0005  # Very mild learning rate
+    anti_hebbian_decay: float = 0.0002  # Faster decay for stability
+    anti_hebbian_tau: float = 50.0  # Trace time constant (ms)
+    som_e_w_max: float = 4.0  # Limited maximum SOM->E weight
+
+    # Preference-based inhibition modulation
+    # Ensembles with similar current orientation preferences get extra inhibition
+    # Set to 0 to disable (can cause instability if preferences fluctuate)
+    pref_inhibition_boost: float = 0.0  # Disabled - use anti-Hebbian only
+    pref_modulation_interval: int = 25  # Only applies if boost > 0
+
+    # Weight orthogonalization (competitive learning)
+    # Pushes co-active ensembles to develop more different weight vectors
+    # Set to 0 to disable (can hurt selectivity if too strong)
+    weight_orthog_eta: float = 0.0  # Disabled - use anti-Hebbian instead
+    weight_orthog_tau: float = 200.0  # Time constant for co-activity tracking
 
     # Lateral excitatory connections (between nearby ensembles)
     w_e_e_lateral: float = 0.5
@@ -340,6 +361,165 @@ class TripletSTDP:
         # Update post traces AFTER computing plasticity
         self.x_post += post_spikes.astype(np.float32)
         self.x_post_slow += post_spikes.astype(np.float32)
+
+        return dW
+
+
+class AntiHebbianLateralInhibition:
+    """
+    Anti-Hebbian plasticity for lateral inhibitory connections.
+
+    Based on Foldiak (1990) and related work: neurons that fire together
+    should inhibit each other more strongly, pushing them to respond to
+    different features (decorrelation).
+
+    Rule: Delta_W_inh[i,j] = eta * y_i * y_j - decay * W_inh[i,j]
+
+    Where y_i and y_j are the activities of ensembles i and j.
+    This increases inhibition between co-active ensembles.
+    """
+
+    def __init__(self, n_ensembles: int, dt_ms: float,
+                 eta: float = 0.001, decay: float = 0.0001,
+                 tau_trace: float = 50.0, w_max: float = 2.0):
+        self.n = n_ensembles
+        self.eta = eta
+        self.decay = decay
+        self.w_max = w_max
+
+        # Activity traces for each ensemble (smoothed spike rate)
+        self.traces = np.zeros(n_ensembles, dtype=np.float32)
+        self.trace_decay = math.exp(-dt_ms / tau_trace)
+
+        # Co-activation matrix (symmetric)
+        # This tracks how often pairs of ensembles fire together
+        self.coact = np.zeros((n_ensembles, n_ensembles), dtype=np.float32)
+        self.coact_decay = math.exp(-dt_ms / (tau_trace * 5))  # Slower decay for integration
+
+    def reset(self):
+        self.traces.fill(0)
+        self.coact.fill(0)
+
+    def update(self, spikes: np.ndarray, W_som_e: np.ndarray) -> np.ndarray:
+        """
+        Update co-activity tracking and return weight changes for SOM->E.
+
+        spikes: (n_ensembles,) binary array of V1 excitatory spikes
+        W_som_e: (n_ensembles, n_som) current SOM->E weights
+
+        Returns: dW for SOM->E weights
+        """
+        # Decay traces
+        self.traces *= self.trace_decay
+        self.coact *= self.coact_decay
+
+        # Update traces with current spikes
+        self.traces += spikes.astype(np.float32)
+
+        # Update co-activation matrix (outer product of traces)
+        # This captures how often pairs fire together
+        self.coact += np.outer(self.traces, self.traces)
+
+        # Zero out diagonal (no self-interaction)
+        np.fill_diagonal(self.coact, 0)
+
+        # Compute weight changes based on co-activity
+        # More co-activation = stronger inhibition
+        # W_som_e shape is (M, n_som) where n_som = M * n_som_per_ensemble
+        # We want to increase inhibition from ensemble j's SOM to ensemble i
+        # when i and j co-activate
+
+        n_som_per = W_som_e.shape[1] // self.n
+        dW = np.zeros_like(W_som_e)
+
+        for j in range(self.n):
+            som_start = j * n_som_per
+            som_end = som_start + n_som_per
+
+            for i in range(self.n):
+                if i != j:
+                    # Increase inhibition from j's SOM to i based on co-activity
+                    delta = self.eta * self.coact[i, j] - self.decay * W_som_e[i, som_start:som_end].mean()
+                    dW[i, som_start:som_end] += delta
+
+        return dW
+
+
+class WeightOrthogonalization:
+    """
+    Weight orthogonalization mechanism based on competitive learning.
+
+    When two ensembles frequently co-fire, their feedforward weight vectors
+    should be pushed apart (made more orthogonal). This ensures that
+    ensembles develop selectivity for different input patterns.
+
+    This is inspired by:
+    - Oja's rule and subspace learning (Oja 1989)
+    - Competitive learning networks (Rumelhart & Zipser 1985)
+    - The idea that co-active neurons should specialize for different inputs
+
+    Rule: When i and j co-fire, modify their weights to reduce overlap:
+    dW_i = -eta * coact[i,j] * (W_i · W_j) * W_j / (||W_j||^2 + eps)
+    dW_j = -eta * coact[i,j] * (W_i · W_j) * W_i / (||W_i||^2 + eps)
+    """
+
+    def __init__(self, n_ensembles: int, dt_ms: float,
+                 eta: float = 0.0001, tau_trace: float = 100.0):
+        self.n = n_ensembles
+        self.eta = eta
+
+        # Activity traces
+        self.traces = np.zeros(n_ensembles, dtype=np.float32)
+        self.trace_decay = math.exp(-dt_ms / tau_trace)
+
+        # Co-activation accumulator (reset periodically)
+        self.coact = np.zeros((n_ensembles, n_ensembles), dtype=np.float32)
+        self.coact_decay = math.exp(-dt_ms / (tau_trace * 10))
+
+    def reset(self):
+        self.traces.fill(0)
+        self.coact.fill(0)
+
+    def update_coact(self, spikes: np.ndarray):
+        """Update co-activity tracking."""
+        self.traces *= self.trace_decay
+        self.coact *= self.coact_decay
+
+        self.traces += spikes.astype(np.float32)
+        self.coact += np.outer(self.traces, self.traces)
+        np.fill_diagonal(self.coact, 0)
+
+    def compute_orthogonalization(self, W: np.ndarray) -> np.ndarray:
+        """
+        Compute weight changes to orthogonalize co-active neurons.
+
+        W: (n_ensembles, n_inputs) weight matrix
+        Returns: dW weight changes
+        """
+        dW = np.zeros_like(W)
+        eps = 1e-6
+
+        for i in range(self.n):
+            for j in range(i + 1, self.n):
+                if self.coact[i, j] < 0.1:  # Skip if negligible co-activation
+                    continue
+
+                # Compute weight overlap (dot product)
+                overlap = float(np.dot(W[i], W[j]))
+
+                if abs(overlap) < eps:
+                    continue
+
+                # Norms
+                norm_i = float(np.dot(W[i], W[i])) + eps
+                norm_j = float(np.dot(W[j], W[j])) + eps
+
+                # Push apart proportional to co-activation and overlap
+                strength = self.eta * self.coact[i, j] * overlap
+
+                # Each weight vector moves away from the other
+                dW[i] -= strength * W[j] / norm_j
+                dW[j] -= strength * W[i] / norm_i
 
         return dW
 
@@ -546,6 +726,27 @@ class RgcLgnV1Network:
         self.stdp = TripletSTDP(self.n_lgn, p.M, p, self.rng)
         self.homeostasis = HomeostaticScaling(p.M, p)
 
+        # Anti-Hebbian plasticity for lateral inhibition
+        # This makes SOM->E weights plastic: ensembles that fire together
+        # will inhibit each other more, pushing them to develop different preferences
+        self.anti_hebbian = AntiHebbianLateralInhibition(
+            n_ensembles=p.M,
+            dt_ms=p.dt_ms,
+            eta=p.anti_hebbian_eta,
+            decay=p.anti_hebbian_decay,
+            tau_trace=p.anti_hebbian_tau,
+            w_max=p.som_e_w_max
+        )
+
+        # Weight orthogonalization for competitive learning
+        # Pushes co-active ensembles to develop different feedforward weights
+        self.weight_orthog = WeightOrthogonalization(
+            n_ensembles=p.M,
+            dt_ms=p.dt_ms,
+            eta=p.weight_orthog_eta,
+            tau_trace=p.weight_orthog_tau
+        )
+
     def reset_state(self) -> None:
         """Reset all dynamic state (but not weights)."""
         self.lgn.reset()
@@ -563,7 +764,134 @@ class RgcLgnV1Network:
         self.ptr = 0
 
         self.stdp.reset()
+        self.anti_hebbian.reset()
+        self.weight_orthog.reset()
         # Note: we don't reset homeostasis to preserve rate estimates
+
+    def modulate_inhibition_by_preference(self, pref_deg: np.ndarray) -> None:
+        """
+        Modulate SOM->E weights based on orientation preference similarity.
+
+        This is a key mechanism for enforcing orientation diversity:
+        ensembles with similar current preferences get EXTRA mutual inhibition,
+        which creates pressure to differentiate.
+
+        This mimics feature-specific inhibition observed in cortex, where
+        neurons with similar preferences tend to inhibit each other more.
+
+        Args:
+            pref_deg: Current preferred orientation for each ensemble (in degrees, 0-180)
+        """
+        p = self.p
+        boost = p.pref_inhibition_boost
+
+        # Compute preference similarity for all pairs
+        # Using circular distance on [0, 180) because orientations are pi-periodic
+        pref = np.asarray(pref_deg, dtype=np.float32) % 180.0
+
+        for i in range(self.M):
+            for j in range(self.M):
+                if i != j:
+                    # Circular distance between preferences
+                    d = abs(pref[i] - pref[j])
+                    d = min(d, 180.0 - d)  # Circular
+
+                    # Similarity weight: 1.0 when identical, 0.0 when 90 degrees apart
+                    similarity = 1.0 - (d / 90.0)  # Linear falloff
+                    similarity = max(0.0, similarity)  # Clamp
+
+                    # Boost inhibition for similar preferences
+                    # SOM j inhibits ensemble i more if they have similar preferences
+                    som_start = j * p.n_som_per_ensemble
+                    som_end = som_start + p.n_som_per_ensemble
+
+                    # Multiplicative boost: w *= (1 + boost * similarity)
+                    factor = 1.0 + boost * similarity
+                    self.W_som_e[i, som_start:som_end] *= factor
+
+        # Normalize to keep total inhibition reasonable
+        # Normalize per-row (each target ensemble gets similar total inhibition)
+        row_sum = self.W_som_e.sum(axis=1, keepdims=True) + 1e-6
+        target_sum = p.w_som_e * (self.M - 1)  # Target total inhibition
+        self.W_som_e *= target_sum / row_sum
+
+        np.clip(self.W_som_e, 0.0, p.som_e_w_max, out=self.W_som_e)
+
+    def retinal_wave(self, direction_deg: float, t_ms: float, wave_speed: float = 0.1,
+                      wave_width: float = 3.0) -> np.ndarray:
+        """
+        Generate a retinal wave stimulus.
+
+        Retinal waves are propagating activity patterns that sweep across the retina
+        during early development, before visual experience. They provide correlated
+        spatiotemporal structure that helps establish initial connectivity biases.
+
+        Parameters:
+        - direction_deg: Direction of wave propagation (0-360)
+        - t_ms: Current time in ms
+        - wave_speed: Speed of wave propagation (pixels per ms)
+        - wave_width: Width of the active wavefront (pixels)
+
+        Returns: Stimulus array with wave pattern
+        """
+        th = math.radians(direction_deg)
+
+        # Wave front position (moves in direction over time)
+        wave_pos = (t_ms * wave_speed) % (2 * self.N)
+
+        # Distance of each pixel from wave front
+        # Project onto wave direction
+        coord = self.X * math.cos(th) + self.Y * math.sin(th)
+
+        # Shift to center the wave
+        coord = coord + self.N / 2.0
+
+        # Create wave profile (Gaussian around wave front)
+        dist_from_front = coord - wave_pos
+        wave = np.exp(-(dist_from_front ** 2) / (2 * wave_width ** 2))
+
+        return wave.astype(np.float32)
+
+    def run_wave_segment(self, direction_deg: float, plastic: bool) -> np.ndarray:
+        """
+        Run one retinal wave segment.
+
+        During wave pre-training, we use lower firing rates and
+        slower wave dynamics to mimic early developmental activity.
+        """
+        p = self.p
+        steps = int(p.segment_ms / p.dt_ms)
+        v1_counts = np.zeros(self.M, dtype=np.int32)
+
+        # Lower gain for wave training (spontaneous activity is weaker)
+        wave_gain = p.gain_rate * 0.5
+        wave_base = p.base_rate * 0.5
+
+        for k in range(steps):
+            wave = self.retinal_wave(direction_deg, t_ms=k * p.dt_ms)
+
+            # Generate ON and OFF spikes from wave
+            # ON cells respond to wave arrival, OFF cells respond to wave leaving
+            on_rate = wave_base + wave_gain * wave
+            off_rate = wave_base + wave_gain * (1.0 - wave) * 0.5  # OFF weaker during waves
+
+            dt_s = p.dt_ms / 1000.0
+            on_spk = (self.rng.random(wave.shape) < (on_rate * dt_s)).astype(np.uint8)
+            off_spk = (self.rng.random(wave.shape) < (off_rate * dt_s)).astype(np.uint8)
+
+            v1_counts += self.step(on_spk, off_spk, plastic=plastic)
+
+        # Apply weight normalization at end of segment
+        if plastic:
+            # Apply weight orthogonalization (push co-active neurons apart)
+            dW_orthog = self.weight_orthog.compute_orthogonalization(self.W)
+            self.W += dW_orthog
+
+            w_sum = self.W.sum(axis=1, keepdims=True) + 1e-6
+            self.W *= (p.w_norm_target / w_sum)
+            np.clip(self.W, 0.0, p.w_max, out=self.W)
+
+        return v1_counts
 
     def grating(self, theta_deg: float, t_ms: float, phase: float) -> np.ndarray:
         """Generate drifting grating stimulus."""
@@ -659,6 +987,18 @@ class RgcLgnV1Network:
             # Clip to valid range
             np.clip(self.W, 0.0, p.w_max, out=self.W)
 
+            # Anti-Hebbian update for lateral inhibition
+            # This increases inhibition between ensembles that fire together,
+            # pushing them to develop different orientation preferences
+            dW_som = self.anti_hebbian.update(v1_spk, self.W_som_e)
+            self.W_som_e += dW_som
+            np.clip(self.W_som_e, 0.0, p.som_e_w_max, out=self.W_som_e)
+
+            # Weight orthogonalization: update co-activity tracking
+            # and periodically apply orthogonalization to push co-active
+            # ensembles to develop different weight patterns
+            self.weight_orthog.update_coact(v1_spk)
+
             # Update homeostatic rate estimate
             self.homeostasis.update_rate(v1_spk, p.dt_ms)
 
@@ -688,6 +1028,10 @@ class RgcLgnV1Network:
         # Apply weight normalization at end of segment
         # This models homeostatic synaptic scaling which operates on slower timescales
         if plastic:
+            # Apply weight orthogonalization (push co-active neurons apart)
+            dW_orthog = self.weight_orthog.compute_orthogonalization(self.W)
+            self.W += dW_orthog
+
             # Normalize total input weight per neuron (heterosynaptic plasticity)
             w_sum = self.W.sum(axis=1, keepdims=True) + 1e-6
             self.W *= (p.w_norm_target / w_sum)
@@ -865,6 +1209,7 @@ def main() -> None:
     ap.add_argument("--out", type=str, default="runs/bio_plausible",
                     help="output directory")
     ap.add_argument("--train-segments", type=int, default=200)
+    ap.add_argument("--wave-segments", type=int, default=50, help="Pre-training segments with retinal waves")
     ap.add_argument("--segment-ms", type=int, default=300)
     ap.add_argument("--N", type=int, default=8, help="Patch size NxN")
     ap.add_argument("--M", type=int, default=8, help="Number of V1 ensembles")
@@ -891,6 +1236,7 @@ def main() -> None:
         som_notch_sigma=float(args.som_notch_sigma),
         seed=args.seed,
         train_segments=args.train_segments,
+        wave_segments=args.wave_segments,
         segment_ms=args.segment_ms
     )
     net = RgcLgnV1Network(p, init_mode=args.init_mode)
@@ -927,21 +1273,63 @@ def main() -> None:
     pv_rate_hist = []
     som_rate_hist = []
 
-    if p.train_segments == 0:
-        print("[final] train-segments=0, no learning occurred")
+    if p.train_segments == 0 and p.wave_segments == 0:
+        print("[final] No training segments, no learning occurred")
         print(f"[done] outputs written to: {args.out}")
         return
 
-    # --- Training ---
-    print("\n[training] Starting STDP training...")
+    # --- Phase 1: Retinal Wave Pre-training ---
+    if p.wave_segments > 0:
+        print(f"\n[wave pre-training] Running {p.wave_segments} retinal wave segments...")
+        print("    Retinal waves provide correlated spatiotemporal structure")
+        print("    to establish initial connectivity biases before visual experience.")
+
+        for s in range(1, p.wave_segments + 1):
+            # Random wave direction (full 360 degrees)
+            direction = float(net.rng.uniform(0.0, 360.0))
+            net.run_wave_segment(direction, plastic=True)
+
+            if s % 10 == 0:
+                print(f"[wave {s:4d}] completed")
+
+        # Evaluate after wave training
+        rates_wave = net.evaluate_tuning(thetas, repeats=3)
+        osi_wave, pref_wave = compute_osi(rates_wave, thetas)
+        d_wave = pref_diversity_metrics(pref_wave, n_bins=int(args.div_bins))
+        print(f"[post-wave] mean rate={rates_wave.mean():.3f} Hz | mean OSI={osi_wave.mean():.3f} | pref_bins={d_wave['unique_bins']}/{int(args.div_bins)}")
+        print(f"            prefs(deg) = {np.round(pref_wave, 1)}")
+
+        # Apply preference modulation after wave training
+        net.modulate_inhibition_by_preference(pref_wave)
+
+    if p.train_segments == 0:
+        print("[final] No visual training segments")
+        print(f"[done] outputs written to: {args.out}")
+        return
+
+    # --- Phase 2: Visual Training ---
+    print("\n[visual training] Starting STDP training with drifting gratings...")
+
+    # Track last computed preferences for modulation
+    last_pref = None
+
     for s in range(1, p.train_segments + 1):
         # Random orientation for this segment
         th = float(net.rng.uniform(0.0, 180.0))
         net.run_segment(th, plastic=True)
 
+        # Apply preference-based modulation more frequently than viz
+        if s % p.pref_modulation_interval == 0 and s < p.train_segments:
+            # Quick evaluation for modulation (fewer repeats)
+            rates_quick = net.evaluate_tuning(thetas, repeats=2)
+            _, pref_quick = compute_osi(rates_quick, thetas)
+            net.modulate_inhibition_by_preference(pref_quick)
+            last_pref = pref_quick
+
         if (s % args.viz_every) == 0 or s == p.train_segments:
             rates = net.evaluate_tuning(thetas, repeats=args.eval_repeats)
             osi, pref = compute_osi(rates, thetas)
+            last_pref = pref
 
             d = pref_diversity_metrics(pref, n_bins=int(args.div_bins))
             print(f"[seg {s:4d}] mean rate={rates.mean():.3f} Hz | mean OSI={osi.mean():.3f} | max OSI={osi.max():.3f} | pref_bins={d['unique_bins']}/{int(args.div_bins)} | min_sep={d['min_sep_deg']:.1f}deg")
