@@ -139,11 +139,19 @@ class Params:
     # E->SOM (lateral inhibition drive from this ensemble)
     w_e_som: float = 6.0
     # SOM->E (lateral inhibition TO OTHER ensembles - NOT self)
-    w_som_e: float = 3.0
+    w_som_e: float = 5.0  # Peak inhibition strength (for strong Mexican hat effect)
+
+    # Mexican hat lateral inhibition parameters
+    # Inhibition profile: I(d) = w_som_e * mexican_hat(d)
+    # mexican_hat(d) = exp(-d²/2σ_far²) - exp(-d²/2σ_near²)
+    # This creates weak inhibition for very near and very far, strong for intermediate
+    # Tuned for clear separation: d=1 weak, d=2-4 strong, d>5 declining
+    mexican_hat_sigma_near: float = 1.8  # Sigma for local (weak inhibition zone)
+    mexican_hat_sigma_far: float = 5.0   # Sigma for surround (determines falloff)
 
     # Lateral excitatory connections (between nearby ensembles)
-    w_e_e_lateral: float = 0.5
-    lateral_sigma: float = 1.5  # Gaussian spread for lateral connections
+    w_e_e_lateral: float = 0.8  # Increased to strengthen local cooperation
+    lateral_sigma: float = 2.0  # Broader spread for lateral connections
 
     # Synaptic time constants
     tau_ampa: float = 5.0   # AMPA receptor
@@ -452,14 +460,23 @@ class RgcLgnV1Network:
 
         # SOM->E connectivity (LATERAL inhibition - inhibits OTHER ensembles)
         # SOM neuron m inhibits all ensembles EXCEPT ensemble m
-        # This creates competition: when ensemble m fires, it inhibits others
+        # Uses Mexican hat profile: weak at short and long distances, strong at intermediate
+        # This creates distance-dependent competition between ensembles
         self.W_som_e = np.zeros((p.M, self.n_som), dtype=np.float32)
         for m in range(p.M):
             som_start = m * p.n_som_per_ensemble
             som_end = som_start + p.n_som_per_ensemble
             for other in range(p.M):
                 if other != m:  # Inhibit others, NOT self
-                    self.W_som_e[other, som_start:som_end] = p.w_som_e / (p.M - 1)
+                    # Circular distance on the ensemble ring
+                    d = min(abs(other - m), p.M - abs(other - m))
+                    # Mexican hat profile: difference of two Gaussians
+                    # Strong inhibition at intermediate distances, weak at near and far
+                    gauss_far = math.exp(-d**2 / (2 * p.mexican_hat_sigma_far**2))
+                    gauss_near = math.exp(-d**2 / (2 * p.mexican_hat_sigma_near**2))
+                    mexican_hat = gauss_far - gauss_near
+                    # Clip to ensure non-negative inhibition
+                    self.W_som_e[other, som_start:som_end] = p.w_som_e * max(0.0, mexican_hat)
 
         # --- Lateral excitatory connectivity ---
         # Gaussian connectivity based on ensemble distance (circular topology)
@@ -766,6 +783,469 @@ def plot_interneuron_activity(pv_rates: List[float], som_rates: List[float],
 
 
 # =============================================================================
+# Inhibition-Orientation Correlation Analysis
+# =============================================================================
+
+def compute_orientation_difference(pref1_deg: float, pref2_deg: float) -> float:
+    """
+    Compute the circular difference between two orientations in [0, 180).
+
+    Returns a value in [0, 90] degrees (since orientations are periodic with period 180).
+    0 means identical orientation, 90 means orthogonal.
+    """
+    diff = abs(pref1_deg - pref2_deg)
+    # Wrap to [0, 180)
+    diff = diff % 180.0
+    # Map to [0, 90] since 0 and 180 are the same orientation
+    if diff > 90:
+        diff = 180 - diff
+    return diff
+
+
+def compute_pairwise_inhibition_matrix(W_som_e: np.ndarray, M: int, n_som_per_ensemble: int = 1) -> np.ndarray:
+    """
+    Compute the effective pairwise lateral inhibition between ensembles.
+
+    W_som_e is (M, n_som) where n_som = M * n_som_per_ensemble.
+    Returns (M, M) matrix where entry [i,j] is the inhibition FROM ensemble j TO ensemble i.
+    """
+    inhibition_matrix = np.zeros((M, M), dtype=np.float32)
+    for j in range(M):  # Source ensemble
+        som_start = j * n_som_per_ensemble
+        som_end = som_start + n_som_per_ensemble
+        for i in range(M):  # Target ensemble
+            # Sum of inhibition weights from SOM neurons of ensemble j to ensemble i
+            inhibition_matrix[i, j] = W_som_e[i, som_start:som_end].sum()
+    return inhibition_matrix
+
+
+def analyze_inhibition_orientation_correlation(
+    pref_deg: np.ndarray,
+    W_som_e: np.ndarray,
+    M: int,
+    n_som_per_ensemble: int = 1
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """
+    Analyze the correlation between lateral inhibition and orientation difference.
+
+    For each pair of neurons (i, j), computes:
+    - Lateral inhibition between them (symmetrized: avg of i->j and j->i)
+    - Orientation difference |pref_i - pref_j| (circular, in [0, 90])
+
+    Returns:
+        inhibition_values: array of pairwise inhibition strengths
+        orientation_diffs: array of pairwise orientation differences
+        correlation: Pearson correlation coefficient
+        p_value: p-value for the correlation (two-tailed)
+    """
+    from scipy import stats
+
+    # Get the inhibition matrix
+    inh_matrix = compute_pairwise_inhibition_matrix(W_som_e, M, n_som_per_ensemble)
+
+    # Collect pairwise values (upper triangle only to avoid duplicates)
+    inhibition_values = []
+    orientation_diffs = []
+
+    for i in range(M):
+        for j in range(i + 1, M):
+            # Symmetrize inhibition (average of i->j and j->i)
+            inh_ij = (inh_matrix[i, j] + inh_matrix[j, i]) / 2.0
+            inhibition_values.append(inh_ij)
+
+            # Orientation difference
+            ori_diff = compute_orientation_difference(pref_deg[i], pref_deg[j])
+            orientation_diffs.append(ori_diff)
+
+    inhibition_values = np.array(inhibition_values)
+    orientation_diffs = np.array(orientation_diffs)
+
+    # Compute correlation
+    if len(inhibition_values) > 2:
+        correlation, p_value = stats.pearsonr(inhibition_values, orientation_diffs)
+    else:
+        correlation, p_value = 0.0, 1.0
+
+    return inhibition_values, orientation_diffs, correlation, p_value
+
+
+def plot_inhibition_profile(W_som_e: np.ndarray, M: int, n_som_per_ensemble: int,
+                            outpath: str, title: str = "Lateral Inhibition Profile") -> None:
+    """Plot the Mexican hat inhibition profile as a function of distance."""
+    # Compute inhibition from ensemble 0 to all others
+    inh_matrix = compute_pairwise_inhibition_matrix(W_som_e, M, n_som_per_ensemble)
+
+    # For visualization, show inhibition from middle ensemble
+    ref_ensemble = M // 2
+
+    # Compute circular distances
+    distances = []
+    inhibitions = []
+    for m in range(M):
+        if m != ref_ensemble:
+            d = min(abs(m - ref_ensemble), M - abs(m - ref_ensemble))
+            distances.append(d)
+            inhibitions.append(inh_matrix[m, ref_ensemble])
+
+    # Sort by distance
+    sorted_pairs = sorted(zip(distances, inhibitions))
+    distances, inhibitions = zip(*sorted_pairs) if sorted_pairs else ([], [])
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(distances, inhibitions, 'o-', markersize=8, linewidth=2)
+    ax.set_xlabel("Circular distance between ensembles", fontsize=12)
+    ax.set_ylabel("Lateral inhibition strength", fontsize=12)
+    ax.set_title(title, fontsize=14)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
+
+def plot_inhibition_matrix(W_som_e: np.ndarray, M: int, n_som_per_ensemble: int,
+                           outpath: str, title: str = "Lateral Inhibition Matrix") -> None:
+    """Plot the full inhibition matrix as a heatmap."""
+    inh_matrix = compute_pairwise_inhibition_matrix(W_som_e, M, n_som_per_ensemble)
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(inh_matrix, cmap='hot', interpolation='nearest')
+    ax.set_xlabel("Source ensemble", fontsize=12)
+    ax.set_ylabel("Target ensemble", fontsize=12)
+    ax.set_title(title, fontsize=14)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Inhibition weight", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
+
+def plot_inhibition_vs_orientation(
+    inhibition_values: np.ndarray,
+    orientation_diffs: np.ndarray,
+    correlation: float,
+    p_value: float,
+    outpath: str,
+    title: str = "Inhibition vs Orientation Difference"
+) -> None:
+    """
+    Create a scatter plot showing the relationship between pairwise
+    lateral inhibition and orientation difference.
+    """
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    # Scatter plot
+    ax.scatter(inhibition_values, orientation_diffs, alpha=0.6, s=40, c='steelblue', edgecolors='navy')
+
+    # Add trend line if there's a meaningful correlation
+    if len(inhibition_values) > 2:
+        z = np.polyfit(inhibition_values, orientation_diffs, 1)
+        p = np.poly1d(z)
+        x_line = np.linspace(inhibition_values.min(), inhibition_values.max(), 100)
+        ax.plot(x_line, p(x_line), 'r--', linewidth=2, label=f'Linear fit')
+
+    ax.set_xlabel("Pairwise lateral inhibition (symmetrized)", fontsize=12)
+    ax.set_ylabel("Orientation difference (degrees)", fontsize=12)
+    ax.set_title(f"{title}\nCorrelation: r={correlation:.3f}, p={p_value:.4f}", fontsize=14)
+    ax.set_ylim([-5, 95])
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+
+    # Add interpretation text
+    if p_value < 0.05:
+        if correlation > 0:
+            interp = "Significant POSITIVE correlation:\nMore inhibition → More different orientations"
+        else:
+            interp = "Significant NEGATIVE correlation:\nMore inhibition → More similar orientations"
+    else:
+        interp = "No significant correlation"
+
+    ax.text(0.02, 0.98, interp, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
+
+def plot_distance_vs_orientation_diff(
+    pref_deg: np.ndarray,
+    M: int,
+    outpath: str,
+    title: str = "Distance vs Orientation Difference"
+) -> None:
+    """
+    Plot how orientation difference varies with ensemble distance.
+    This helps visualize if nearby neurons develop similar orientations.
+    """
+    distances = []
+    orientation_diffs = []
+
+    for i in range(M):
+        for j in range(i + 1, M):
+            d = min(abs(i - j), M - abs(i - j))
+            ori_diff = compute_orientation_difference(pref_deg[i], pref_deg[j])
+            distances.append(d)
+            orientation_diffs.append(ori_diff)
+
+    distances = np.array(distances)
+    orientation_diffs = np.array(orientation_diffs)
+
+    # Compute mean orientation difference at each distance
+    unique_distances = np.unique(distances)
+    mean_ori_diff = [orientation_diffs[distances == d].mean() for d in unique_distances]
+    std_ori_diff = [orientation_diffs[distances == d].std() for d in unique_distances]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Scatter plot
+    ax1.scatter(distances, orientation_diffs, alpha=0.5, s=30, c='steelblue')
+    ax1.set_xlabel("Circular distance between ensembles", fontsize=12)
+    ax1.set_ylabel("Orientation difference (degrees)", fontsize=12)
+    ax1.set_title("All pairwise comparisons", fontsize=12)
+    ax1.set_ylim([-5, 95])
+    ax1.grid(True, alpha=0.3)
+
+    # Mean with error bars
+    ax2.errorbar(unique_distances, mean_ori_diff, yerr=std_ori_diff,
+                 fmt='o-', markersize=10, linewidth=2, capsize=5, color='darkblue')
+    ax2.axhline(y=45, color='gray', linestyle='--', alpha=0.5, label='Random expectation (45°)')
+    ax2.set_xlabel("Circular distance between ensembles", fontsize=12)
+    ax2.set_ylabel("Mean orientation difference (degrees)", fontsize=12)
+    ax2.set_title("Mean orientation difference by distance", fontsize=12)
+    ax2.set_ylim([-5, 95])
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=10)
+
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
+
+def analyze_mexican_hat_effect(
+    pref_deg: np.ndarray,
+    W_som_e: np.ndarray,
+    M: int,
+    n_som_per_ensemble: int = 1
+) -> dict:
+    """
+    Analyze whether the Mexican hat inhibition profile produces the expected
+    pattern: nearby neurons (low inhibition) → similar orientations,
+    intermediate neurons (high inhibition) → different orientations.
+
+    This analysis is designed for non-monotonic relationships that follow
+    the Mexican hat shape.
+
+    Returns a dictionary with:
+    - near_mean_diff: Mean orientation difference for nearest neighbors
+    - peak_inh_mean_diff: Mean orientation difference for peak inhibition pairs
+    - effect_size: Difference between peak and near (positive = expected pattern)
+    - t_statistic, p_value: Statistical test comparing near vs peak
+    """
+    from scipy import stats
+
+    inh_matrix = compute_pairwise_inhibition_matrix(W_som_e, M, n_som_per_ensemble)
+
+    # Collect data organized by inhibition level
+    inhibition_levels = []
+    orientation_diffs = []
+    distances = []
+
+    for i in range(M):
+        for j in range(i + 1, M):
+            d = min(abs(i - j), M - abs(i - j))
+            inh_ij = (inh_matrix[i, j] + inh_matrix[j, i]) / 2.0
+            ori_diff = compute_orientation_difference(pref_deg[i], pref_deg[j])
+
+            inhibition_levels.append(inh_ij)
+            orientation_diffs.append(ori_diff)
+            distances.append(d)
+
+    inhibition_levels = np.array(inhibition_levels)
+    orientation_diffs = np.array(orientation_diffs)
+    distances = np.array(distances)
+
+    # Find inhibition thresholds for "near" (low inhibition) and "peak" (high inhibition)
+    inh_25 = np.percentile(inhibition_levels, 25)  # Low inhibition threshold
+    inh_75 = np.percentile(inhibition_levels, 75)  # High inhibition threshold
+
+    # Alternative: use distance-based grouping which is cleaner
+    # Near = d=1, Peak = d where inhibition is maximum
+    near_mask = distances == 1
+    peak_d = distances[np.argmax([inhibition_levels[distances == d].mean()
+                                   for d in np.unique(distances) if (distances == d).sum() > 0]
+                                  if len(np.unique(distances)) > 0 else [1])]
+
+    # Find the distance with maximum mean inhibition
+    unique_d = np.unique(distances)
+    mean_inh_by_d = {d: inhibition_levels[distances == d].mean() for d in unique_d}
+    peak_d = max(mean_inh_by_d, key=mean_inh_by_d.get)
+    peak_mask = distances == peak_d
+
+    near_ori_diffs = orientation_diffs[near_mask]
+    peak_ori_diffs = orientation_diffs[peak_mask]
+
+    near_mean = near_ori_diffs.mean() if len(near_ori_diffs) > 0 else 45.0
+    peak_mean = peak_ori_diffs.mean() if len(peak_ori_diffs) > 0 else 45.0
+
+    # Effect size: positive means peak inhibition → larger orientation differences
+    effect_size = peak_mean - near_mean
+
+    # Statistical test
+    if len(near_ori_diffs) > 1 and len(peak_ori_diffs) > 1:
+        t_stat, p_val = stats.ttest_ind(peak_ori_diffs, near_ori_diffs)
+    else:
+        t_stat, p_val = 0.0, 1.0
+
+    # Also compute correlation for monotonic portion (low to peak)
+    # This tests if the rising part of Mexican hat shows expected pattern
+    rising_mask = distances <= peak_d
+    if rising_mask.sum() > 2:
+        rising_corr, rising_p = stats.pearsonr(
+            inhibition_levels[rising_mask],
+            orientation_diffs[rising_mask]
+        )
+    else:
+        rising_corr, rising_p = 0.0, 1.0
+
+    return {
+        'near_mean_diff': near_mean,
+        'peak_mean_diff': peak_mean,
+        'effect_size': effect_size,
+        'peak_distance': peak_d,
+        't_statistic': t_stat,
+        'p_value': p_val,
+        'rising_correlation': rising_corr,
+        'rising_p_value': rising_p,
+        'random_expectation': 45.0
+    }
+
+
+def run_inhibition_orientation_analysis(
+    net: 'RgcLgnV1Network',
+    pref_deg: np.ndarray,
+    osi: np.ndarray,
+    outdir: str,
+    prefix: str = ""
+) -> dict:
+    """
+    Run complete analysis of inhibition-orientation correlation.
+
+    Args:
+        net: The trained network
+        pref_deg: Preferred orientations of each ensemble (degrees)
+        osi: OSI values for each ensemble
+        outdir: Directory to save plots
+        prefix: Prefix for output filenames
+
+    Returns:
+        Dictionary with analysis results
+    """
+    p = net.p
+    M = p.M
+    n_som_per_ensemble = p.n_som_per_ensemble
+
+    # Compute correlation
+    inh_vals, ori_diffs, corr, pval = analyze_inhibition_orientation_correlation(
+        pref_deg, net.W_som_e, M, n_som_per_ensemble
+    )
+
+    # Generate all plots
+    plot_inhibition_profile(
+        net.W_som_e, M, n_som_per_ensemble,
+        os.path.join(outdir, f"{prefix}inhibition_profile.png"),
+        "Mexican Hat Lateral Inhibition Profile"
+    )
+
+    plot_inhibition_matrix(
+        net.W_som_e, M, n_som_per_ensemble,
+        os.path.join(outdir, f"{prefix}inhibition_matrix.png"),
+        "Lateral Inhibition Matrix (SOM→E)"
+    )
+
+    plot_inhibition_vs_orientation(
+        inh_vals, ori_diffs, corr, pval,
+        os.path.join(outdir, f"{prefix}inhibition_vs_orientation.png"),
+        "Lateral Inhibition vs Orientation Difference"
+    )
+
+    plot_distance_vs_orientation_diff(
+        pref_deg, M,
+        os.path.join(outdir, f"{prefix}distance_vs_orientation.png"),
+        "Ensemble Distance vs Orientation Difference"
+    )
+
+    # Run Mexican hat specific analysis
+    mh_results = analyze_mexican_hat_effect(pref_deg, net.W_som_e, M, n_som_per_ensemble)
+
+    # Summary statistics
+    results = {
+        'correlation': corr,
+        'p_value': pval,
+        'mean_osi': float(osi.mean()),
+        'std_osi': float(osi.std()),
+        'frac_osi_above_0.3': float((osi > 0.3).mean()),
+        'frac_osi_above_0.5': float((osi > 0.5).mean()),
+        'mean_orientation_diff': float(ori_diffs.mean()),
+        'inhibition_values': inh_vals,
+        'orientation_diffs': ori_diffs,
+        'mexican_hat_analysis': mh_results
+    }
+
+    print(f"\n{'='*70}")
+    print("INHIBITION-ORIENTATION CORRELATION ANALYSIS")
+    print(f"{'='*70}")
+
+    print("\n--- ORIENTATION SELECTIVITY ---")
+    print(f"Mean OSI: {osi.mean():.3f} +/- {osi.std():.3f}")
+    print(f"Fraction with OSI > 0.3: {(osi > 0.3).mean()*100:.1f}%")
+    print(f"Fraction with OSI > 0.5: {(osi > 0.5).mean()*100:.1f}%")
+
+    print("\n--- LINEAR CORRELATION TEST ---")
+    print(f"Pearson correlation (r): {corr:.4f}")
+    print(f"P-value: {pval:.4f}")
+    print(f"Significant at p<0.05: {'YES' if pval < 0.05 else 'NO'}")
+
+    print("\n--- MEXICAN HAT EFFECT TEST ---")
+    print(f"(Tests if nearby neurons develop similar orientations,")
+    print(f" while neurons at peak inhibition distance develop different orientations)")
+    print(f"")
+    print(f"Near neighbors (d=1) mean orientation diff: {mh_results['near_mean_diff']:.1f}°")
+    print(f"Peak inhibition (d={mh_results['peak_distance']}) mean orientation diff: {mh_results['peak_mean_diff']:.1f}°")
+    print(f"Random expectation: {mh_results['random_expectation']:.1f}°")
+    print(f"")
+    print(f"Effect size (peak - near): {mh_results['effect_size']:.1f}°")
+    print(f"T-test p-value: {mh_results['p_value']:.4f}")
+    print(f"Significant at p<0.05: {'YES' if mh_results['p_value'] < 0.05 else 'NO'}")
+    print(f"")
+    print(f"Rising portion correlation (d=1 to peak): {mh_results['rising_correlation']:.4f}")
+    print(f"Rising portion p-value: {mh_results['rising_p_value']:.4f}")
+
+    print("\n--- INTERPRETATION ---")
+    if mh_results['effect_size'] > 5 and mh_results['near_mean_diff'] < 40:
+        print("STRONG MEXICAN HAT EFFECT DETECTED!")
+        print(f"- Nearby neurons (d=1) develop SIMILAR orientations ({mh_results['near_mean_diff']:.1f}° < 45° random)")
+        print(f"- Neurons at peak inhibition develop MORE DIFFERENT orientations ({mh_results['peak_mean_diff']:.1f}°)")
+        if mh_results['p_value'] < 0.05:
+            print("- This effect is STATISTICALLY SIGNIFICANT.")
+        print("\nThis confirms the hypothesis: lateral inhibition shapes orientation maps")
+        print("such that competitive (high inhibition) pairs differentiate while")
+        print("cooperative (low inhibition) pairs develop similar preferences.")
+    elif mh_results['near_mean_diff'] < 40:
+        print("PARTIAL MEXICAN HAT EFFECT:")
+        print(f"- Nearby neurons show similar orientations ({mh_results['near_mean_diff']:.1f}° < 45° random)")
+        print(f"- Effect size is modest ({mh_results['effect_size']:.1f}°)")
+    else:
+        print("WEAK OR NO MEXICAN HAT EFFECT:")
+        print("- The expected pattern is not clearly visible in this run.")
+        print("- This could be due to random variation or insufficient training.")
+
+    print(f"{'='*70}\n")
+
+    return results
+
+
+# =============================================================================
 # Main training loop
 # =============================================================================
 
@@ -883,6 +1363,12 @@ def main() -> None:
     plot_scalar_over_time(np.array(seg_hist), np.array(rate_hist),
                          os.path.join(args.out, "mean_rate_over_time.png"),
                          ylabel="mean rate (Hz)", title="Mean firing rate over training")
+
+    # --- Inhibition-Orientation Correlation Analysis ---
+    print("\n[analysis] Running inhibition-orientation correlation analysis...")
+    analysis_results = run_inhibition_orientation_analysis(
+        net, pref1, osi1, args.out, prefix=""
+    )
 
     print(f"\n[done] Outputs written to: {args.out}")
 
