@@ -773,10 +773,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Biologically plausible V1 STDP network")
     ap.add_argument("--out", type=str, default="runs/bio_plausible",
                     help="output directory")
-    ap.add_argument("--train-segments", type=int, default=200)
+    ap.add_argument("--train-segments", type=int, default=1000)
     ap.add_argument("--segment-ms", type=int, default=300)
     ap.add_argument("--N", type=int, default=8, help="Patch size NxN")
-    ap.add_argument("--M", type=int, default=8, help="Number of V1 ensembles")
+    ap.add_argument("--M", type=int, default=32, help="Number of V1 ensembles")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--viz-every", type=int, default=50)
     ap.add_argument("--eval-K", type=int, default=12, help="Number of orientations to test")
